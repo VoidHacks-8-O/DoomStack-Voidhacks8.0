@@ -7,7 +7,9 @@ from app.database.repositories.account import AccountRepository
 from app.database.repositories.dataset import DatasetRepository
 from app.schemas.account import AccountSummaryResponse, AccountTransactionsResponse
 from app.schemas.investigation import InvestigationTraceResponse
+from app.schemas.risk import AccountRiskProfileResponse
 from app.services.investigation import InvestigationService
+from app.services.risk_engine import RiskAssessmentService
 
 account_router = APIRouter(prefix="/accounts", tags=["accounts"])
 investigation_router = APIRouter(prefix="/investigations", tags=["investigations"])
@@ -76,6 +78,39 @@ async def get_account_transactions(
         limit=limit,
         direction_filter=direction,
     )
+
+
+@account_router.get(
+    "/{account_id}/risk",
+    response_model=AccountRiskProfileResponse,
+    summary="Calculate explainable Mule Risk Index and candidate classifications",
+)
+async def get_account_risk(
+    account_id: str,
+    dataset_id: str | None = Query(None, description="Optional dataset ID. Defaults to latest dataset."),
+):
+    """Retrieve explainable 0-100 Mule Risk Index, feature evidence contract, and L1/L2/L3 classifications."""
+    conn = get_connection()
+    repo_ds = DatasetRepository(conn)
+
+    if not dataset_id:
+        latest = repo_ds.get_latest_dataset()
+        if not latest:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No datasets found in database.",
+            )
+        dataset_id = latest["dataset_id"]
+
+    risk_service = RiskAssessmentService(conn)
+    profile = risk_service.assess_account_risk(account_id=account_id, dataset_id=dataset_id)
+    if not profile:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Account '{account_id}' not found in dataset '{dataset_id}'.",
+        )
+    return profile
+
 
 
 @investigation_router.get(

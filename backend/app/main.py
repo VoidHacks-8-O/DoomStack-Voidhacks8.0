@@ -9,6 +9,8 @@ from app.config.settings import settings
 from app.database.duckdb import close, connect
 from app.routers.dataset import router as dataset_router
 from app.routers.investigations import account_router, investigation_router
+from app.routers.recovery import router as recovery_router
+from app.routers.syndicate import router as syndicate_router
 from app.utils.logging import logger
 
 
@@ -59,3 +61,6 @@ async def health_check():
 app.include_router(dataset_router, prefix="/api")
 app.include_router(account_router, prefix="/api")
 app.include_router(investigation_router, prefix="/api")
+app.include_router(recovery_router, prefix="/api")
+app.include_router(syndicate_router, prefix="/api")
+

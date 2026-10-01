@@ -172,3 +172,50 @@ class AccountRepository:
             total_transactions=len(items),
             transactions=items,
         )
+
+    def get_all_account_transactions(
+        self,
+        account_id: str,
+        dataset_id: str,
+    ) -> list[AccountTransactionItem]:
+        """Reconstruct full chronological transaction timeline for an account without truncation."""
+        res = self.get_account_transactions(
+            account_id=account_id,
+            dataset_id=dataset_id,
+            limit=50000,
+        )
+        return res.transactions
+
+    def get_positive_net_flow_accounts(
+        self,
+        dataset_id: str,
+        min_net_flow: float = 0.01,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Retrieve accounts with positive observed net flow strictly within the dataset scope."""
+        query = """
+            SELECT
+                account_id,
+                in_amount,
+                out_amount,
+                (in_amount - out_amount) AS observed_net_flow,
+                first_tx_timestamp,
+                last_tx_timestamp
+            FROM account_features
+            WHERE dataset_id = ? AND (in_amount - out_amount) >= ?
+            ORDER BY observed_net_flow DESC
+            LIMIT ?
+        """
+        rows = self.conn.execute(query, [dataset_id, min_net_flow, limit]).fetchall()
+        return [
+            {
+                "account_id": r[0],
+                "in_amount": float(r[1]),
+                "out_amount": float(r[2]),
+                "observed_net_flow": float(r[3]),
+                "first_tx_timestamp": r[4],
+                "last_tx_timestamp": r[5],
+            }
+            for r in rows
+        ]
+
