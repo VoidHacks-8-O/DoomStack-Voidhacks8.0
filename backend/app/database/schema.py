@@ -1,5 +1,7 @@
 """DuckDB schema definitions and migrations for ANVITRACE."""
 
+import contextlib
+
 import duckdb
 
 SCHEMA_SQL = """
@@ -47,6 +49,9 @@ CREATE TABLE IF NOT EXISTS transactions (
     Narration VARCHAR,
     IP_Address VARCHAR,
     Device_Type VARCHAR,
+    raw_timestamp VARCHAR,
+    raw_amount VARCHAR,
+    raw_payment_mode VARCHAR,
     dataset_id VARCHAR NOT NULL REFERENCES datasets(dataset_id),
     source_row BIGINT NOT NULL,
     validation_status VARCHAR NOT NULL,
@@ -117,3 +122,7 @@ CREATE TABLE IF NOT EXISTS evidence_items (
 def apply_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Execute DDL statements to ensure all canonical tables and indexes exist."""
     conn.execute(SCHEMA_SQL)
+    # Schema migration: add provenance columns if table was created previously
+    for col in ("raw_timestamp", "raw_amount", "raw_payment_mode"):
+        with contextlib.suppress(Exception):
+            conn.execute(f"ALTER TABLE transactions ADD COLUMN {col} VARCHAR;")

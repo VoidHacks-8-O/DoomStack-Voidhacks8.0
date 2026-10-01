@@ -34,6 +34,7 @@ from app.indexes.manager import ForensicIndexManager
 from app.utils.logging import log_event, logger
 from app.utils.validators import (
     validate_account_id,
+    validate_account_ifsc_consistency,
     validate_amount,
     validate_ifsc,
     validate_payment_mode,
@@ -96,8 +97,27 @@ class IngestionService:
         self.conn.execute(f"DELETE FROM transactions WHERE dataset_id = '{dataset_id}'")
         self.conn.execute(f"DELETE FROM account_features WHERE dataset_id = '{dataset_id}'")
 
-        # 3. Stream through CSV chunks via Polars
-        reader = pl.read_csv_batched(str(file_path), batch_size=chunk_size)
+        # 3. Stream through CSV chunks via Polars (read_csv_batched)
+        reader = pl.read_csv_batched(
+            str(file_path),
+            batch_size=chunk_size,
+            schema_overrides={
+                "Transaction_ID": pl.String,
+                "Timestamp": pl.String,
+                "Sender_Account": pl.String,
+                "Sender_Name": pl.String,
+                "Sender_IFSC": pl.String,
+                "Receiver_Account": pl.String,
+                "Receiver_Name": pl.String,
+                "Receiver_IFSC": pl.String,
+                "Amount": pl.String,
+                "Payment_Mode": pl.String,
+                "Status": pl.String,
+                "Narration": pl.String,
+                "IP_Address": pl.String,
+                "Device_Type": pl.String,
+            },
+        )
 
         total_rows = 0
         valid_rows = 0
@@ -159,6 +179,17 @@ class IngestionService:
                     is_valid = False
                     val_errs.append(r_ifsc_clean)
 
+                # Check account and IFSC prefix consistency
+                ok_s_cons, cons_s_err = validate_account_ifsc_consistency(sender, s_ifsc)
+                if not ok_s_cons:
+                    is_valid = False
+                    val_errs.append(cons_s_err)
+
+                ok_r_cons, cons_r_err = validate_account_ifsc_consistency(receiver, r_ifsc)
+                if not ok_r_cons:
+                    is_valid = False
+                    val_errs.append(cons_r_err)
+
                 ok_amt, amt_val, amt_err = validate_amount(raw_amt)
                 if not ok_amt:
                     is_valid = False
@@ -181,7 +212,7 @@ class IngestionService:
                     invalid_rows += 1
                     status_flag = STATUS_INVALID
 
-                # Repeated Transaction_ID check
+                # Repeated Transaction_ID check (separate from exact duplicate)
                 is_repeated = False
                 if tx_id in seen_tx_ids:
                     is_repeated = True
@@ -189,8 +220,11 @@ class IngestionService:
                 else:
                     seen_tx_ids.add(tx_id)
 
-                # Exact duplicate detection across all source fields
-                row_fingerprint = f"{tx_id}|{sender}|{receiver}|{s_ifsc}|{r_ifsc}|{amt_val}|{ts_clean}|{mode_clean}"
+                # Exact duplicate detection across COMPLETE source row fields (including Narration, IP, Device)
+                row_fingerprint = (
+                    f"{tx_id}|{sender}|{receiver}|{s_ifsc}|{r_ifsc}|{raw_amt!s}|"
+                    f"{raw_ts!s}|{raw_mode}|{narration or ''}|{ip_addr or ''}|{device or ''}"
+                )
                 is_exact_dup = False
                 if row_fingerprint in seen_row_hashes:
                     is_exact_dup = True
@@ -215,6 +249,9 @@ class IngestionService:
                         "Narration": narration,
                         "IP_Address": ip_addr,
                         "Device_Type": device,
+                        "raw_timestamp": str(raw_ts) if raw_ts is not None else None,
+                        "raw_amount": str(raw_amt) if raw_amt is not None else None,
+                        "raw_payment_mode": raw_mode if raw_mode else None,
                         "dataset_id": dataset_id,
                         "source_row": global_row_idx,
                         "validation_status": status_flag,
@@ -235,6 +272,7 @@ class IngestionService:
                         record_id, Transaction_ID, Sender_Account, Receiver_Account,
                         Sender_IFSC, Receiver_IFSC, Amount, Timestamp,
                         Payment_Mode, Narration, IP_Address, Device_Type,
+                        raw_timestamp, raw_amount, raw_payment_mode,
                         dataset_id, source_row, validation_status,
                         is_repeated_tx, is_exact_duplicate
                     )
@@ -242,8 +280,9 @@ class IngestionService:
                         record_id, Transaction_ID, Sender_Account, Receiver_Account,
                         Sender_IFSC, Receiver_IFSC, CAST(Amount AS DECIMAL(18, 2)),
                         CAST(Timestamp AS TIMESTAMP), Payment_Mode, Narration,
-                        IP_Address, Device_Type, dataset_id, source_row,
-                        validation_status, is_repeated_tx, is_exact_duplicate
+                        IP_Address, Device_Type, raw_timestamp, raw_amount, raw_payment_mode,
+                        dataset_id, source_row, validation_status,
+                        is_repeated_tx, is_exact_duplicate
                     FROM batch_chunk
                     """
                 )

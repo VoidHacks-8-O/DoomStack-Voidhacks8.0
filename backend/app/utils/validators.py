@@ -41,6 +41,27 @@ def validate_ifsc(ifsc: str | None) -> tuple[bool, str]:
     return True, clean
 
 
+def validate_account_ifsc_consistency(account: str | None, ifsc: str | None) -> tuple[bool, str]:
+    """Verify account and IFSC consistency where supported.
+
+    When both account and IFSC are provided, verifies that bank prefixes or
+    routing codes do not conflict. For standard Indian banking accounts with
+    bank prefix identifiers, cross-checks compatibility.
+    """
+    if not account or not ifsc:
+        return True, ""  # Handled by individual validators
+    clean_acc = account.strip().upper()
+    clean_ifsc = ifsc.strip().upper()
+
+    # If account starts with letters, ensure they match bank code prefix if both alphabetic
+    acc_prefix = clean_acc[:4]
+    ifsc_prefix = clean_ifsc[:4]
+    if acc_prefix.isalpha() and ifsc_prefix.isalpha() and acc_prefix != ifsc_prefix:
+        return False, f"Account prefix '{acc_prefix}' conflicts with IFSC bank prefix '{ifsc_prefix}'"
+
+    return True, ""
+
+
 def validate_amount(amount: Any) -> tuple[bool, float, str]:
     """Validate exact monetary value. Returns (is_valid, float_val, error_msg)."""
     if amount is None:

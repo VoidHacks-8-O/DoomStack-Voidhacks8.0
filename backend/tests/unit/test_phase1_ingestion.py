@@ -136,9 +136,11 @@ def test_full_ingestion_and_rules(in_memory_db, sample_csv, tmp_path: Path):
     assert result["repeated_tx_ids"] == 2  # rows 2 and 3 repeated TX1001
     assert result["exact_duplicates"] == 1  # row 3 is exact duplicate of row 1
 
-    # Check database records
+    # Check database records including raw preserved columns
     records = in_memory_db.execute(
-        "SELECT record_id, Transaction_ID, source_row, validation_status, is_repeated_tx, is_exact_duplicate FROM transactions WHERE dataset_id = 'ds_test_01' ORDER BY source_row ASC"
+        """SELECT record_id, Transaction_ID, source_row, validation_status,
+                  is_repeated_tx, is_exact_duplicate, raw_timestamp, raw_amount, raw_payment_mode
+           FROM transactions WHERE dataset_id = 'ds_test_01' ORDER BY source_row ASC"""
     ).fetchall()
 
     assert len(records) == 8
@@ -151,30 +153,41 @@ def test_full_ingestion_and_rules(in_memory_db, sample_csv, tmp_path: Path):
     source_rows = [r[2] for r in records]
     assert source_rows == list(range(1, 9))
 
-    # Row 1 check: valid, not repeated, not exact dup
+    # Row 1 check: valid, not repeated, not exact dup, raw values preserved
     r1 = records[0]
     assert r1[1] == "TX1001"
     assert r1[3] == STATUS_VALID
     assert r1[4] is False
     assert r1[5] is False
+    assert r1[6] == "2026-03-01 10:00:00"
+    assert r1[7] == "15000.00"
+    assert r1[8] == "UPI"
 
-    # Row 2 check: valid, repeated TX, not exact dup
+    # Row 2 check: valid, repeated TX, not exact dup (different receiver & amount)
     r2 = records[1]
     assert r2[1] == "TX1001"
     assert r2[3] == STATUS_VALID
     assert r2[4] is True
     assert r2[5] is False
 
-    # Row 3 check: valid, repeated TX, exact dup
+    # Row 3 check: valid, repeated TX, exact dup of Row 1
     r3 = records[2]
     assert r3[1] == "TX1001"
     assert r3[3] == STATUS_VALID
     assert r3[4] is True
     assert r3[5] is True
 
-    # Row 4 check: invalid
+    # Row 4 check: invalid account length
     r4 = records[3]
     assert r4[3] == STATUS_INVALID
+
+    # Test account and IFSC prefix consistency
+    from app.utils.validators import validate_account_ifsc_consistency
+    ok_cons, _ = validate_account_ifsc_consistency("SBIN12345678", "SBIN0001234")
+    assert ok_cons is True
+    ok_incons, err_incons = validate_account_ifsc_consistency("HDFC12345678", "SBIN0001234")
+    assert ok_incons is False
+    assert "conflicts" in err_incons
 
 
 def test_dataset_hash_deterministic(sample_csv):
