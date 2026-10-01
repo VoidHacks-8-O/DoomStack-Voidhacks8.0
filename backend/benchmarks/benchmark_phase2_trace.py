@@ -65,7 +65,13 @@ def benchmark_four_hop_latency(
     inv_svc = InvestigationService(conn)
     latencies_ms: list[float] = []
 
+    import tracemalloc
+    tracemalloc.start()
+
     print(f"\n--- EXECUTING {num_queries} FOUR-HOP TRACE QUERIES ---")
+    cold_latency_ms: float | None = None
+    warm_latencies_ms: list[float] = []
+
     for i in range(num_queries):
         acc = random.choice(sample_accounts)
         t0 = time.perf_counter()
@@ -76,29 +82,59 @@ def benchmark_four_hop_latency(
         )
         elapsed_ms = (time.perf_counter() - t0) * 1000
         latencies_ms.append(elapsed_ms)
-        if (i + 1) % 10 == 0 or (i + 1) == num_queries:
-            print(f"Query {i + 1}/{num_queries} -> {len(trace.money_trail)} edges found in {elapsed_ms:.2f} ms")
+
+        if i == 0:
+            cold_latency_ms = elapsed_ms
+            print(f"Query 1 (Cold Run) -> {len(trace.money_trail)} edges found in {elapsed_ms:.2f} ms")
+        else:
+            warm_latencies_ms.append(elapsed_ms)
+            if (i + 1) % 10 == 0 or (i + 1) == num_queries:
+                print(f"Query {i + 1}/{num_queries} (Warm) -> {len(trace.money_trail)} edges found in {elapsed_ms:.2f} ms")
+
+    _, peak_mem = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    peak_ram_mb = peak_mem / (1024 * 1024)
 
     # Calculate statistics
     latencies_ms.sort()
-    p50 = statistics.median(latencies_ms)
-    p95 = latencies_ms[int(len(latencies_ms) * 0.95)]
-    p99 = latencies_ms[int(len(latencies_ms) * 0.99)]
-    mean_val = statistics.mean(latencies_ms)
+    overall_p50 = statistics.median(latencies_ms)
+    overall_p95 = latencies_ms[int(len(latencies_ms) * 0.95)]
+    overall_p99 = latencies_ms[int(len(latencies_ms) * 0.99)]
+    overall_mean = statistics.mean(latencies_ms)
 
-    print("\n================ LATENCY BENCHMARK RESULTS ================")
-    print(f"Queries Executed        : {num_queries}")
-    print(f"Mean Latency            : {mean_val:.2f} ms")
-    print(f"p50 Latency (Median)    : {p50:.2f} ms")
-    print(f"p95 Latency             : {p95:.2f} ms")
-    print(f"p99 Latency             : {p99:.2f} ms")
-    print(f"Max Latency             : {max(latencies_ms):.2f} ms")
-    print("----------------------------------------------------------")
-    if p99 <= 2000.0:
-        print(f">> PERFORMANCE TARGET (<= 2.0s per trace): ACHIEVED (p99 = {p99:.2f} ms) <<")
+    if warm_latencies_ms:
+        warm_latencies_ms.sort()
+        warm_p50 = statistics.median(warm_latencies_ms)
+        warm_p95 = warm_latencies_ms[int(len(warm_latencies_ms) * 0.95)]
+        warm_p99 = warm_latencies_ms[int(len(warm_latencies_ms) * 0.99)]
+        warm_mean = statistics.mean(warm_latencies_ms)
     else:
-        print(f">> PERFORMANCE TARGET: EXCEEDED TARGET ({p99:.2f} ms > 2000 ms) <<")
-    print("==========================================================\n")
+        warm_p50 = warm_p95 = warm_p99 = warm_mean = cold_latency_ms or 0.0
+
+    print("\n================ LATENCY & RESOURCE BENCHMARK RESULTS ================")
+    print(f"Total Queries Executed  : {num_queries}")
+    print("----------------------------------------------------------")
+    print(f"COLD RUN (First Query)  : {cold_latency_ms:.2f} ms")
+    print("----------------------------------------------------------")
+    print("WARM RUN METRICS (Subsequent Queries):")
+    print(f"  Warm Mean Latency     : {warm_mean:.2f} ms")
+    print(f"  Warm p50 (Median)     : {warm_p50:.2f} ms")
+    print(f"  Warm p95              : {warm_p95:.2f} ms")
+    print(f"  Warm p99              : {warm_p99:.2f} ms")
+    print("----------------------------------------------------------")
+    print("OVERALL METRICS:")
+    print(f"  Overall Mean Latency  : {overall_mean:.2f} ms")
+    print(f"  Overall p50           : {overall_p50:.2f} ms")
+    print(f"  Overall p95           : {overall_p95:.2f} ms")
+    print(f"  Overall p99           : {overall_p99:.2f} ms")
+    print("----------------------------------------------------------")
+    print(f"PEAK TRACE RAM USAGE    : {peak_ram_mb:.2f} MB")
+    print("----------------------------------------------------------")
+    if overall_p99 <= 2000.0:
+        print(f">> PERFORMANCE TARGET (<= 2.0s per trace): ACHIEVED (Overall p99 = {overall_p99:.2f} ms, Warm p99 = {warm_p99:.2f} ms) <<")
+    else:
+        print(f">> PERFORMANCE TARGET: EXCEEDED TARGET ({overall_p99:.2f} ms > 2000 ms) <<")
+    print("=======================================================================\n")
     conn.close()
 
 

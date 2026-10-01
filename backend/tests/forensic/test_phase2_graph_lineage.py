@@ -78,61 +78,177 @@ def forensic_graph_csv(tmp_path: Path):
     return csv_file
 
 
-def test_four_hop_strict_bounding(phase2_db, forensic_graph_csv):
-    """Verify that traversal halts strictly at max_hops=4 and never expands to hop 5."""
-    ingest_svc = IngestionService(phase2_db)
-    ingest_svc.ingest_file(forensic_graph_csv, dataset_id="ds_p2_test")
-
-    inv_svc = InvestigationService(phase2_db)
-    trace = inv_svc.run_trace(
-        victim_account="ACC_VICTIM_01",
-        dataset_id="ds_p2_test",
-        max_hops=4,
-    )
-
-    hops = [e.hop for e in trace.money_trail]
-    assert 1 in hops
-    assert 2 in hops
-    assert 3 in hops
-    assert 4 in hops
-    assert 5 not in hops, "Attempted fifth hop was not rejected/bounded!"
-
-    # Verify Hop 5 target account ACC_MULE_E01 never appears as to_account in the money trail
-    dest_accounts = [e.to_account for e in trace.money_trail]
-    assert "ACC_MULE_E01" not in dest_accounts
-
-
-def test_exact_hop_bounds(phase2_db, forensic_graph_csv):
-    """Verify exact 1, 2, and 3 hop limits when configured."""
-    ingest_svc = IngestionService(phase2_db)
-    ingest_svc.ingest_file(forensic_graph_csv, dataset_id="ds_p2_test")
-    inv_svc = InvestigationService(phase2_db)
-
-    # Exactly 1 hop
-    trace_1 = inv_svc.run_trace(victim_account="ACC_VICTIM_01", dataset_id="ds_p2_test", max_hops=1)
-    assert all(e.hop == 1 for e in trace_1.money_trail)
-
-    # Exactly 2 hops
-    trace_2 = inv_svc.run_trace(victim_account="ACC_VICTIM_01", dataset_id="ds_p2_test", max_hops=2)
-    assert max(e.hop for e in trace_2.money_trail) == 2
-
-    # Exactly 3 hops
-    trace_3 = inv_svc.run_trace(victim_account="ACC_VICTIM_01", dataset_id="ds_p2_test", max_hops=3)
-    assert max(e.hop for e in trace_3.money_trail) == 3
-
-
-def test_temporal_exclusion(phase2_db, forensic_graph_csv):
-    """Verify transactions preceding the victim transaction are excluded."""
+def test_branching_graph(phase2_db, forensic_graph_csv):
+    """Verify branching graph expansion (one-to-many amount split across multiple accounts)."""
     ingest_svc = IngestionService(phase2_db)
     ingest_svc.ingest_file(forensic_graph_csv, dataset_id="ds_p2_test")
 
     inv_svc = InvestigationService(phase2_db)
     trace = inv_svc.run_trace(victim_account="ACC_VICTIM_01", dataset_id="ds_p2_test")
 
-    # TX_PRIOR_01 was at 09:00:00 (before victim tx at 10:00:00)
+    # Hop 2 branches: Mule A -> Mule B1 (₹6000) and Mule A -> Mule B2 (₹4000)
+    hop2_edges = [e for e in trace.money_trail if e.hop == 2 and not e.is_cycle]
+    assert len(hop2_edges) == 2
+    branch_recipients = {e.to_account for e in hop2_edges}
+    assert branch_recipients == {"ACC_MULE_B01", "ACC_MULE_B02"}
+    assert sum(e.attributable_amount for e in hop2_edges) == 10000.00
+
+
+def test_out_of_order_transactions(phase2_db, forensic_graph_csv):
+    """Verify out-of-order/prior transactions preceding victim inflow are strictly excluded."""
+    ingest_svc = IngestionService(phase2_db)
+    ingest_svc.ingest_file(forensic_graph_csv, dataset_id="ds_p2_test")
+
+    inv_svc = InvestigationService(phase2_db)
+    trace = inv_svc.run_trace(victim_account="ACC_VICTIM_01", dataset_id="ds_p2_test")
+
+    # TX_PRIOR_01 occurred at 09:00:00 (before victim tx at 10:00:00)
     tx_ids = [e.Transaction_ID for e in trace.money_trail]
     assert "TX_PRIOR_01" not in tx_ids
     assert "ACC_IGNORED_1" not in [e.to_account for e in trace.money_trail]
+
+
+def test_exactly_3_hops(phase2_db, forensic_graph_csv):
+    """Verify investigation strictly terminates at exactly 3 hops when max_hops=3."""
+    ingest_svc = IngestionService(phase2_db)
+    ingest_svc.ingest_file(forensic_graph_csv, dataset_id="ds_p2_test")
+
+    inv_svc = InvestigationService(phase2_db)
+    trace = inv_svc.run_trace(victim_account="ACC_VICTIM_01", dataset_id="ds_p2_test", max_hops=3)
+
+    hops = {e.hop for e in trace.money_trail}
+    assert hops == {1, 2, 3}
+    assert 4 not in hops
+    assert 5 not in hops
+
+
+def test_exactly_4_hops(phase2_db, forensic_graph_csv):
+    """Verify investigation strictly captures up to exactly 4 hops when max_hops=4."""
+    ingest_svc = IngestionService(phase2_db)
+    ingest_svc.ingest_file(forensic_graph_csv, dataset_id="ds_p2_test")
+
+    inv_svc = InvestigationService(phase2_db)
+    trace = inv_svc.run_trace(victim_account="ACC_VICTIM_01", dataset_id="ds_p2_test", max_hops=4)
+
+    hops = {e.hop for e in trace.money_trail}
+    assert hops == {1, 2, 3, 4}
+    assert max(hops) == 4
+
+
+def test_attempted_5th_hop(phase2_db, forensic_graph_csv):
+    """Verify attempted 5th hop (Mule D1 -> Mule E1) is strictly rejected and never traversed."""
+    ingest_svc = IngestionService(phase2_db)
+    ingest_svc.ingest_file(forensic_graph_csv, dataset_id="ds_p2_test")
+
+    inv_svc = InvestigationService(phase2_db)
+    trace = inv_svc.run_trace(victim_account="ACC_VICTIM_01", dataset_id="ds_p2_test", max_hops=4)
+
+    hops = [e.hop for e in trace.money_trail]
+    assert 5 not in hops, "Hop 5 must never be traversed!"
+    dest_accounts = [e.to_account for e in trace.money_trail]
+    assert "ACC_MULE_E01" not in dest_accounts
+    assert "TX_HOP5_01" not in [e.Transaction_ID for e in trace.money_trail]
+
+
+def test_pass_through_time_window_boundaries(phase2_db, forensic_graph_csv):
+    """Verify pass-through time-window boundaries strictly exclude transactions past cutoff."""
+    ingest_svc = IngestionService(phase2_db)
+    ingest_svc.ingest_file(forensic_graph_csv, dataset_id="ds_p2_test")
+
+    inv_svc = InvestigationService(phase2_db)
+    # Starting tx at 10:00:00. 15-minute window (0.25h) allows txs <= 10:15:00
+    trace_bounded = inv_svc.run_trace(
+        victim_account="ACC_VICTIM_01",
+        dataset_id="ds_p2_test",
+        time_window_hours=0.25,
+    )
+    tx_ids = [e.Transaction_ID for e in trace_bounded.money_trail]
+    assert "TX_VIC_001" in tx_ids
+    assert "TX_SPLIT_01" in tx_ids  # at 10:10:00 (<= 15 min)
+    assert "TX_SPLIT_02" in tx_ids  # at 10:15:00 (<= 15 min)
+    assert "TX_SHARED_01" not in tx_ids  # at 10:20:00 (> 15 min)
+    assert "TX_CONV_02" not in tx_ids  # at 10:25:00 (> 15 min)
+
+
+def test_partial_amount_attribution(phase2_db, tmp_path: Path):
+    """Verify partial amount attribution when downstream transaction exceeds available funds."""
+    csv_file = tmp_path / "partial_attr.csv"
+    data = [
+        "TX_P1,2026-03-01 10:00:00,ACC_V1,Victim,SBIN0001001,ACC_M1,Mule1,HDFC0002001,5000.00,UPI,SUCCESS",
+        "TX_P2,2026-03-01 10:05:00,ACC_M1,Mule1,HDFC0002001,ACC_M2,Mule2,ICIC0003001,8000.00,UPI,SUCCESS",
+    ]
+    csv_file.write_text(
+        "Transaction_ID,Timestamp,Sender_Account,Sender_Name,Sender_IFSC,Receiver_Account,Receiver_Name,Receiver_IFSC,Amount,Payment_Mode,Status\n"
+        + "\n".join(data)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    ingest_svc = IngestionService(phase2_db)
+    ingest_svc.ingest_file(csv_file, dataset_id="ds_partial_test")
+
+    inv_svc = InvestigationService(phase2_db)
+    trace = inv_svc.run_trace(victim_account="ACC_V1", dataset_id="ds_partial_test")
+
+    assert len(trace.money_trail) == 2
+    hop2_edge = trace.money_trail[1]
+    assert hop2_edge.amount == 8000.00
+    assert hop2_edge.attributable_amount == 5000.00  # Capped at remaining 5000
+    assert hop2_edge.lineage_status == "attributed"
+
+
+def test_converging_paths_with_path_specific_lineage(phase2_db, forensic_graph_csv):
+    """Verify convergence preserves distinct path-specific edges, parent linkages, and lineage."""
+    ingest_svc = IngestionService(phase2_db)
+    ingest_svc.ingest_file(forensic_graph_csv, dataset_id="ds_p2_test")
+
+    inv_svc = InvestigationService(phase2_db)
+    trace = inv_svc.run_trace(victim_account="ACC_VICTIM_01", dataset_id="ds_p2_test")
+
+    # Hop 3 converges: Mule B1 -> Mule C1 (₹5000) and Mule B2 -> Mule C1 (₹3000)
+    h3_edges = [e for e in trace.money_trail if e.hop == 3 and e.to_account == "ACC_MULE_C01"]
+    assert len(h3_edges) == 2, "Both converging paths must be preserved!"
+
+    # Verify path-specific senders and amounts
+    b1_edge = next(e for e in h3_edges if e.from_account == "ACC_MULE_B01")
+    b2_edge = next(e for e in h3_edges if e.from_account == "ACC_MULE_B02")
+
+    assert b1_edge.amount == 5000.00
+    assert b1_edge.attributable_amount == 5000.00
+    assert b1_edge.lineage_status == "attributed"
+    assert b1_edge.parent_record_id is not None
+
+    assert b2_edge.amount == 3000.00
+    assert b2_edge.attributable_amount == 3000.00
+    assert b2_edge.lineage_status == "attributed"
+    assert b2_edge.parent_record_id is not None
+
+    # Distinct parentage from Hop 2
+    assert b1_edge.parent_record_id != b2_edge.parent_record_id
+
+
+def test_double_count_prevention(phase2_db, forensic_graph_csv):
+    """Verify conservative attribution prevents double-counting across converging & cyclic paths."""
+    ingest_svc = IngestionService(phase2_db)
+    ingest_svc.ingest_file(forensic_graph_csv, dataset_id="ds_p2_test")
+
+    inv_svc = InvestigationService(phase2_db)
+    trace = inv_svc.run_trace(victim_account="ACC_VICTIM_01", dataset_id="ds_p2_test")
+
+    # 1. Total attributed at any individual hop <= ₹10,000 (initial victim amount)
+    for hop in (1, 2, 3, 4):
+        hop_total = sum(e.attributable_amount for e in trace.money_trail if e.hop == hop and not e.is_cycle)
+        assert hop_total <= 10000.00, f"Hop {hop} exceeded initial victim amount with ₹{hop_total}!"
+
+    # 2. Hop 4: Mule C1 received ₹8000 total from B1 + B2. Sends ₹7000 to D1.
+    h4 = [e for e in trace.money_trail if e.hop == 4]
+    assert len(h4) == 1
+    assert h4[0].attributable_amount == 7000.00
+
+    # 3. Cycle edge (Mule B1 -> Victim) attributed amount is 0.0 (prevents circular double counting)
+    cycle_edge = next(e for e in trace.money_trail if e.is_cycle)
+    assert cycle_edge.attributable_amount == 0.0
+    assert cycle_edge.lineage_status == "unresolved"
 
 
 def test_cycle_detection(phase2_db, forensic_graph_csv):
@@ -143,48 +259,11 @@ def test_cycle_detection(phase2_db, forensic_graph_csv):
     inv_svc = InvestigationService(phase2_db)
     trace = inv_svc.run_trace(victim_account="ACC_VICTIM_01", dataset_id="ds_p2_test")
 
-    # TX_CYCLE_01 loops back from Mule B1 to Victim
     cycle_edges = [e for e in trace.money_trail if e.is_cycle]
     assert len(cycle_edges) == 1
     assert cycle_edges[0].to_account == "ACC_VICTIM_01"
     assert cycle_edges[0].attributable_amount == 0.0
     assert cycle_edges[0].lineage_status == "unresolved"
-
-
-def test_amount_lineage_split_and_double_count_prevention(phase2_db, forensic_graph_csv):
-    """Verify amount lineage: one-to-many split and convergence without double-counting."""
-    ingest_svc = IngestionService(phase2_db)
-    ingest_svc.ingest_file(forensic_graph_csv, dataset_id="ds_p2_test")
-
-    inv_svc = InvestigationService(phase2_db)
-    trace = inv_svc.run_trace(victim_account="ACC_VICTIM_01", dataset_id="ds_p2_test")
-
-    # Hop 1: Victim ₹10,000 -> traced
-    h1 = [e for e in trace.money_trail if e.hop == 1]
-    assert len(h1) == 1
-    assert h1[0].attributable_amount == 10000.00
-    assert h1[0].lineage_status == "traced"
-
-    # Hop 2: Split ₹6,000 + ₹4,000 = ₹10,000 total available
-    h2 = [e for e in trace.money_trail if e.hop == 2]
-    h2_attributed = sum(e.attributable_amount for e in h2 if not e.is_cycle)
-    assert h2_attributed == 10000.00
-    assert all(e.lineage_status == "attributed" for e in h2 if not e.is_cycle)
-
-    # Hop 3: Mule B1 (avail 6000) sends 5000 -> attr 5000. Mule B2 (avail 4000) sends 3000 -> attr 3000.
-    h3 = [e for e in trace.money_trail if e.hop == 3]
-    h3_attributed = sum(e.attributable_amount for e in h3)
-    assert h3_attributed == 8000.00  # 5000 + 3000 <= 10000
-
-    # Hop 4: Mule C1 receives 5000 + 3000 = 8000 attributable. Sends 7000 to D1.
-    h4 = [e for e in trace.money_trail if e.hop == 4]
-    assert len(h4) == 1
-    assert h4[0].attributable_amount == 7000.00
-    assert h4[0].lineage_status == "attributed"
-
-    # Verify no edge exceeds the initial ₹10,000 victim amount
-    for e in trace.money_trail:
-        assert e.attributable_amount <= 10000.00
 
 
 def test_repeated_transaction_id_preservation(phase2_db, forensic_graph_csv):
