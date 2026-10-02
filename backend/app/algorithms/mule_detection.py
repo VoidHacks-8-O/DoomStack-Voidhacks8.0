@@ -32,87 +32,226 @@ class MuleDetectionEngine:
         self,
         transactions: list[AccountTransactionItem],
     ) -> dict[str, Any]:
-        """Detect accounts where incoming value is rapidly dispersed within configured interval.
+        """Detect accounts exhibiting rapid pass-through signal based on incoming-relative timing.
 
-        Tied to each specific incoming transaction and subsequent outgoing transactions.
+        Evaluates:
+        - Percentage of incoming value dispersed
+        - Elapsed time from the relevant incoming transaction
+        - Number of outgoing transfers and destinations
+        - Official 90% criterion within configured 3-15 minute window
+        - Graduated signal strength: STRONG (>=90%), MODERATE (80-89.99%), WEAK (70-79.99%), LOW/NO SIGNAL (<70%)
+        - Double-count prevention across consecutive incoming transactions
         """
         in_txs = [t for t in transactions if t.direction == "IN" and t.amount > 0]
         out_txs = [t for t in transactions if t.direction == "OUT" and t.amount > 0]
 
-        window_sec = self.config.rapid_pass_through_window_minutes * 60.0
-        min_ratio = self.config.rapid_pass_through_min_ratio
+        # Sort both chronologically
+        in_txs_sorted = sorted(in_txs, key=lambda x: (x.timestamp, x.record_id))
+        out_txs_sorted = sorted(out_txs, key=lambda x: (x.timestamp, x.record_id))
+
+        max_window_sec = self.config.rapid_pass_through_max_minutes * 60.0
+
+        # Available capacity per outgoing transaction to prevent double counting
+        out_remaining: dict[str, float] = {t.record_id: t.amount for t in out_txs_sorted}
 
         incidents: list[dict[str, Any]] = []
         all_supporting_record_ids: list[str] = []
         all_supporting_tx_ids: list[str] = []
 
-        # Sort outgoing transactions by timestamp
-        out_txs_sorted = sorted(out_txs, key=lambda x: (x.timestamp, x.record_id))
-
-        for in_tx in in_txs:
+        for in_tx in in_txs_sorted:
             in_ts = in_tx.timestamp
             in_amt = in_tx.amount
+            in_remaining = in_amt
 
-            # Outgoing transactions within [in_ts, in_ts + window]
             dispersed_txs: list[AccountTransactionItem] = []
-            dispersed_amt = 0.0
+            dispersed_amounts: dict[str, float] = {}
 
             for out_tx in out_txs_sorted:
                 if out_tx.timestamp < in_ts:
                     continue
                 diff_sec = (out_tx.timestamp - in_ts).total_seconds()
-                if diff_sec <= window_sec:
-                    dispersed_txs.append(out_tx)
-                    dispersed_amt += out_tx.amount
+                if diff_sec <= max_window_sec:
+                    avail = out_remaining.get(out_tx.record_id, 0.0)
+                    if avail > 0.001 and in_remaining > 0.001:
+                        alloc = min(in_remaining, avail)
+                        in_remaining -= alloc
+                        out_remaining[out_tx.record_id] -= alloc
+                        dispersed_txs.append(out_tx)
+                        dispersed_amounts[out_tx.record_id] = alloc
                 elif out_tx.timestamp > in_ts:
-                    # Outgoing txs are sorted, but we continue checking until out_tx exceeds window
                     break
 
-            if in_amt > 0:
-                ratio = round(dispersed_amt / in_amt, 4)
-                if ratio >= min_ratio and dispersed_txs:
-                    latest_out_ts = max(t.timestamp for t in dispersed_txs)
-                    elapsed_min = round((latest_out_ts - in_ts).total_seconds() / 60.0, 2)
+            dispersed_amt = round(in_amt - in_remaining, 2)
+            ratio = round(dispersed_amt / in_amt, 4) if in_amt > 0 else 0.0
+            percentage = round(ratio * 100.0, 2)
 
-                    rec_ids = [in_tx.record_id] + [t.record_id for t in dispersed_txs]
-                    tx_ids = [in_tx.Transaction_ID] + [t.Transaction_ID for t in dispersed_txs]
+            if dispersed_txs:
+                latest_out_ts = max(t.timestamp for t in dispersed_txs)
+                elapsed_min = round((latest_out_ts - in_ts).total_seconds() / 60.0, 2)
+            else:
+                elapsed_min = 0.0
 
-                    incidents.append(
-                        {
-                            "incoming_record_id": in_tx.record_id,
-                            "incoming_tx_id": in_tx.Transaction_ID,
-                            "incoming_amount": in_amt,
-                            "incoming_timestamp": in_ts.isoformat(),
-                            "dispersed_outgoing_amount": round(dispersed_amt, 2),
-                            "percentage": round(ratio * 100.0, 2),
-                            "elapsed_minutes": elapsed_min,
-                            "outgoing_transactions_count": len(dispersed_txs),
-                            "supporting_record_ids": rec_ids,
-                            "supporting_transaction_ids": tx_ids,
-                        }
-                    )
-                    all_supporting_record_ids.extend(rec_ids)
-                    all_supporting_tx_ids.extend(tx_ids)
+            # Official criterion: >= 90% dispersed within the configured 3-15 minute window
+            is_within_window = (
+                self.config.rapid_pass_through_min_minutes <= elapsed_min <= self.config.rapid_pass_through_max_minutes
+            )
+            official_criterion_met = (
+                ratio >= self.config.rapid_pass_through_official_ratio and is_within_window
+            )
 
-        is_detected = len(incidents) > 0
-        primary = max(incidents, key=lambda x: x["percentage"]) if incidents else None
+            # Graduated signal strength (only within valid evaluation window)
+            if is_within_window:
+                if ratio >= self.config.pass_through_strong_ratio:
+                    sig_strength = "STRONG"
+                    score_contrib = self.config.weight_rapid_pass_through
+                elif ratio >= self.config.pass_through_moderate_ratio:
+                    sig_strength = "MODERATE"
+                    score_contrib = round(self.config.weight_rapid_pass_through * 0.75, 2)
+                elif ratio >= self.config.pass_through_weak_ratio:
+                    sig_strength = "WEAK"
+                    score_contrib = round(self.config.weight_rapid_pass_through * 0.50, 2)
+                else:
+                    sig_strength = "LOW/NO SIGNAL"
+                    score_contrib = 0.0
+            else:
+                sig_strength = "LOW/NO SIGNAL"
+                score_contrib = 0.0
 
-        # Deduplicate ids preserving order
-        dedup_records = list(dict.fromkeys(all_supporting_record_ids))
-        dedup_txs = list(dict.fromkeys(all_supporting_tx_ids))
+            destinations = sorted({t.counterparty_account for t in dispersed_txs if t.counterparty_account})
+            rec_ids = [in_tx.record_id] + [t.record_id for t in dispersed_txs] if dispersed_txs else []
+            tx_ids = [in_tx.Transaction_ID] + [t.Transaction_ID for t in dispersed_txs] if dispersed_txs else []
+
+            incident = {
+                "incoming_record_id": in_tx.record_id,
+                "incoming_tx_id": in_tx.Transaction_ID,
+                "incoming_amount": in_amt,
+                "incoming_timestamp": in_ts.isoformat(),
+                "dispersed_outgoing_amount": dispersed_amt,
+                "percentage": percentage,
+                "elapsed_time": elapsed_min,
+                "elapsed_minutes": elapsed_min,
+                "number_of_outgoing_transfers": len(dispersed_txs),
+                "destinations": destinations,
+                "official_criterion_met": official_criterion_met,
+                "signal_strength": sig_strength,
+                "score_contribution": score_contrib,
+                "supporting_record_ids": rec_ids,
+                "supporting_transaction_ids": tx_ids,
+            }
+            incidents.append(incident)
+
+            if sig_strength != "LOW/NO SIGNAL":
+                all_supporting_record_ids.extend(rec_ids)
+                all_supporting_tx_ids.extend(tx_ids)
+
+        # Rank incidents to determine primary signal
+        severity_rank = {"STRONG": 3, "MODERATE": 2, "WEAK": 1, "LOW/NO SIGNAL": 0}
+        active_incidents = [i for i in incidents if i["signal_strength"] != "LOW/NO SIGNAL"]
+
+        if active_incidents:
+            primary = max(
+                active_incidents,
+                key=lambda x: (severity_rank[x["signal_strength"]], x["percentage"], -x["elapsed_minutes"]),
+            )
+        elif incidents:
+            primary = max(
+                incidents,
+                key=lambda x: (x["percentage"], -x["elapsed_minutes"]),
+            )
+        else:
+            primary = None
+
+        is_detected = primary is not None and primary["signal_strength"] != "LOW/NO SIGNAL"
+        primary_strength = primary["signal_strength"] if primary else "LOW/NO SIGNAL"
+        primary_official_met = primary["official_criterion_met"] if primary else False
+        primary_elapsed = primary["elapsed_minutes"] if primary else 0.0
+        primary_score_contrib = primary["score_contribution"] if primary else 0.0
+        primary_percentage = primary["percentage"] if primary else 0.0
+        primary_incoming_amt = primary["incoming_amount"] if primary else 0.0
+        primary_dispersed_amt = primary["dispersed_outgoing_amount"] if primary else 0.0
+        primary_out_count = primary["number_of_outgoing_transfers"] if primary else 0
+        primary_destinations = primary["destinations"] if primary else []
+
+        # Candidate explanation conforming to forensic terminology
+        if primary_strength == "STRONG":
+            explanation = (
+                f"Pass-through signal [STRONG]: {primary_percentage}% of incoming funds (₹{primary_incoming_amt:,.2f}) "
+                f"dispersed across {primary_out_count} transfer(s) to {len(primary_destinations)} destination(s) "
+                f"within {primary_elapsed}m (Official 90% criterion met). Candidate indicator for investigative prioritization."
+            )
+        elif primary_strength == "MODERATE":
+            explanation = (
+                f"Pass-through signal [MODERATE]: {primary_percentage}% of incoming funds (₹{primary_incoming_amt:,.2f}) "
+                f"dispersed across {primary_out_count} transfer(s) to {len(primary_destinations)} destination(s) "
+                f"within {primary_elapsed}m (Official 90% criterion not met). Moderate candidate indicator."
+            )
+        elif primary_strength == "WEAK":
+            explanation = (
+                f"Pass-through signal [WEAK]: {primary_percentage}% of incoming funds (₹{primary_incoming_amt:,.2f}) "
+                f"dispersed across {primary_out_count} transfer(s) to {len(primary_destinations)} destination(s) "
+                f"within {primary_elapsed}m (Official 90% criterion not met). Weak candidate indicator."
+            )
+        else:
+            explanation = "No rapid pass-through candidate indicator observed within configured window."
+
+        dedup_records = list(dict.fromkeys(all_supporting_record_ids)) if is_detected else []
+        dedup_txs = list(dict.fromkeys(all_supporting_tx_ids)) if is_detected else []
+
+        official_threshold = {
+            "min_ratio": self.config.rapid_pass_through_official_ratio,
+            "min_minutes": self.config.rapid_pass_through_min_minutes,
+            "max_minutes": self.config.rapid_pass_through_max_minutes,
+        }
+
+        measured_value = {
+            "percentage": primary_percentage,
+            "elapsed_time": primary_elapsed,
+            "elapsed_minutes": primary_elapsed,
+            "number_of_outgoing_transfers": primary_out_count,
+            "destinations": primary_destinations,
+            "incoming_amount": primary_incoming_amt,
+            "dispersed_outgoing_amount": primary_dispersed_amt,
+            "official_threshold": official_threshold,
+            "official_criterion_met": primary_official_met,
+            "official_pass_through_criterion_met": primary_official_met,
+            "signal_strength": primary_strength,
+            "is_detected": is_detected,
+            "incidents_count": len(active_incidents),
+            "primary_incident": primary,
+        }
+
+        threshold_configured = {
+            "official_criterion": official_threshold,
+            "graduated_severity_thresholds": {
+                "STRONG": self.config.pass_through_strong_ratio,
+                "MODERATE": self.config.pass_through_moderate_ratio,
+                "WEAK": self.config.pass_through_weak_ratio,
+            },
+            "window_minutes": self.config.rapid_pass_through_max_minutes,
+            "min_ratio": self.config.pass_through_weak_ratio,
+        }
 
         return {
+            "feature_name": "rapid_pass_through",
             "is_detected": is_detected,
-            "incidents_count": len(incidents),
+            "measured_value": measured_value,
+            "elapsed_time": primary_elapsed,
+            "official_threshold": official_threshold,
+            "official_criterion_met": primary_official_met,
+            "official_pass_through_criterion_met": primary_official_met,
+            "signal_strength": primary_strength,
+            "incidents_count": len(active_incidents),
             "primary_incident": primary,
             "all_incidents": incidents,
             "supporting_record_ids": dedup_records,
             "supporting_transaction_ids": dedup_txs,
-            "threshold_configured": {
-                "window_minutes": self.config.rapid_pass_through_window_minutes,
-                "min_ratio": min_ratio,
-            },
+            "data_quality_confidence": 1.0 if transactions else 0.5,
+            "score_contribution": primary_score_contrib,
+            "explanation": explanation,
+            "human_readable_explanation": explanation,
+            "threshold_configured": threshold_configured,
         }
+
 
     def detect_fan_in(
         self,

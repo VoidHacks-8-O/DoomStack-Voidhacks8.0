@@ -20,14 +20,17 @@ Verifies:
 17. cross-victim shared infrastructure candidate correlation
 """
 
+from datetime import datetime
 from pathlib import Path
 
 import duckdb
 import pytest
 
 from app.algorithms.evaluation import ForensicRiskEvaluator
+from app.algorithms.mule_detection import MuleDetectionEngine
 from app.config.risk_rules import DEFAULT_RISK_CONFIG
 from app.database.schema import apply_schema
+from app.schemas.account import AccountTransactionItem
 from app.schemas.syndicate import CrossVictimAnalysisRequest
 from app.services.cross_victim import CrossVictimService
 from app.services.ingestion import IngestionService
@@ -383,3 +386,196 @@ def test_evaluation_tooling(ingested_phase3_db):
     assert 0.0 <= metrics.precision <= 1.0
     assert 0.0 <= metrics.recall <= 1.0
     assert 0.0 <= metrics.false_positive_rate <= 1.0
+
+
+# --- Dedicated Pass-Through Logic Verification Tests ---
+
+def _make_tx(record_id: str, tx_id: str, direction: str, amount: float, ts_str: str, counterparty: str = "ACC_OTHER") -> AccountTransactionItem:
+    return AccountTransactionItem(
+        record_id=record_id,
+        Transaction_ID=tx_id,
+        direction=direction,
+        amount=amount,
+        timestamp=datetime.fromisoformat(ts_str),
+        counterparty_account=counterparty,
+        payment_mode="UPI",
+    )
+
+
+def test_pass_through_90_percent_within_3_minutes_official_met():
+    """Verify >= 90% within 3 minutes meets the official criterion and yields STRONG signal."""
+    engine = MuleDetectionEngine(DEFAULT_RISK_CONFIG)
+    in_tx = _make_tx("rec_in_1", "TX_IN_1", "IN", 10000.0, "2026-03-01 10:00:00")
+    out_tx = _make_tx("rec_out_1", "TX_OUT_1", "OUT", 9000.0, "2026-03-01 10:03:00")
+
+    res = engine.detect_rapid_pass_through([in_tx, out_tx])
+
+    assert res["is_detected"] is True
+    assert res["official_criterion_met"] is True
+    assert res["official_pass_through_criterion_met"] is True
+    assert res["signal_strength"] == "STRONG"
+    assert res["score_contribution"] == 20.0
+    assert res["elapsed_time"] == 3.0
+    assert res["measured_value"]["percentage"] == 90.0
+    assert res["supporting_record_ids"] == ["rec_in_1", "rec_out_1"]
+
+
+def test_pass_through_90_percent_within_15_minutes_official_met():
+    """Verify >= 90% within 15 minutes meets the official criterion and yields STRONG signal."""
+    engine = MuleDetectionEngine(DEFAULT_RISK_CONFIG)
+    in_tx = _make_tx("rec_in_2", "TX_IN_2", "IN", 10000.0, "2026-03-01 10:00:00")
+    out_tx = _make_tx("rec_out_2", "TX_OUT_2", "OUT", 9000.0, "2026-03-01 10:15:00")
+
+    res = engine.detect_rapid_pass_through([in_tx, out_tx])
+
+    assert res["is_detected"] is True
+    assert res["official_criterion_met"] is True
+    assert res["official_pass_through_criterion_met"] is True
+    assert res["signal_strength"] == "STRONG"
+    assert res["score_contribution"] == 20.0
+    assert res["elapsed_time"] == 15.0
+    assert res["measured_value"]["percentage"] == 90.0
+
+
+def test_pass_through_80_percent_moderate_signal():
+    """Verify 80-89.99% within valid window yields MODERATE signal (official criterion not met)."""
+    engine = MuleDetectionEngine(DEFAULT_RISK_CONFIG)
+    in_tx = _make_tx("rec_in_3", "TX_IN_3", "IN", 10000.0, "2026-03-01 10:00:00")
+    out_tx = _make_tx("rec_out_3", "TX_OUT_3", "OUT", 8000.0, "2026-03-01 10:10:00")
+
+    res = engine.detect_rapid_pass_through([in_tx, out_tx])
+
+    assert res["is_detected"] is True
+    assert res["official_criterion_met"] is False
+    assert res["signal_strength"] == "MODERATE"
+    assert res["score_contribution"] == 15.0
+    assert res["measured_value"]["percentage"] == 80.0
+    assert res["elapsed_time"] == 10.0
+
+
+def test_pass_through_70_to_79_percent_weak_signal():
+    """Verify 70-79.99% within valid window yields WEAK signal (official criterion not met)."""
+    engine = MuleDetectionEngine(DEFAULT_RISK_CONFIG)
+    in_tx = _make_tx("rec_in_4", "TX_IN_4", "IN", 10000.0, "2026-03-01 10:00:00")
+    out_tx = _make_tx("rec_out_4", "TX_OUT_4", "OUT", 7500.0, "2026-03-01 10:08:00")
+
+    res = engine.detect_rapid_pass_through([in_tx, out_tx])
+
+    assert res["is_detected"] is True
+    assert res["official_criterion_met"] is False
+    assert res["signal_strength"] == "WEAK"
+    assert res["score_contribution"] == 10.0
+    assert res["measured_value"]["percentage"] == 75.0
+
+
+def test_pass_through_under_70_percent_low_no_signal():
+    """Verify < 70% yields LOW/NO SIGNAL and zero score contribution."""
+    engine = MuleDetectionEngine(DEFAULT_RISK_CONFIG)
+    in_tx = _make_tx("rec_in_5", "TX_IN_5", "IN", 10000.0, "2026-03-01 10:00:00")
+    out_tx = _make_tx("rec_out_5", "TX_OUT_5", "OUT", 6500.0, "2026-03-01 10:08:00")
+
+    res = engine.detect_rapid_pass_through([in_tx, out_tx])
+
+    assert res["is_detected"] is False
+    assert res["official_criterion_met"] is False
+    assert res["signal_strength"] == "LOW/NO SIGNAL"
+    assert res["score_contribution"] == 0.0
+    assert res["supporting_record_ids"] == []
+
+
+def test_pass_through_90_percent_outside_configured_window():
+    """Verify 90% dispersed outside configured window (25m > 15m) does NOT meet official criterion."""
+    engine = MuleDetectionEngine(DEFAULT_RISK_CONFIG)
+    in_tx = _make_tx("rec_in_6", "TX_IN_6", "IN", 10000.0, "2026-03-01 10:00:00")
+    out_tx = _make_tx("rec_out_6", "TX_OUT_6", "OUT", 9000.0, "2026-03-01 10:25:00")
+
+    res = engine.detect_rapid_pass_through([in_tx, out_tx])
+
+    assert res["official_criterion_met"] is False
+    assert res["signal_strength"] == "LOW/NO SIGNAL"
+    assert res["score_contribution"] == 0.0
+
+
+def test_pass_through_multiple_outgoing_transfers():
+    """Verify pass-through dispersing across multiple outgoing destinations."""
+    engine = MuleDetectionEngine(DEFAULT_RISK_CONFIG)
+    in_tx = _make_tx("rec_in_7", "TX_IN_7", "IN", 10000.0, "2026-03-01 10:00:00")
+    out1 = _make_tx("rec_out_7a", "TX_OUT_7A", "OUT", 4000.0, "2026-03-01 10:05:00", counterparty="ACC_DST_1")
+    out2 = _make_tx("rec_out_7b", "TX_OUT_7B", "OUT", 5000.0, "2026-03-01 10:12:00", counterparty="ACC_DST_2")
+
+    res = engine.detect_rapid_pass_through([in_tx, out1, out2])
+
+    assert res["official_criterion_met"] is True
+    assert res["signal_strength"] == "STRONG"
+    assert res["measured_value"]["number_of_outgoing_transfers"] == 2
+    assert set(res["measured_value"]["destinations"]) == {"ACC_DST_1", "ACC_DST_2"}
+    assert res["elapsed_time"] == 12.0
+    assert len(res["supporting_record_ids"]) == 3
+
+
+def test_pass_through_partial_attribution():
+    """Verify partial attribution correctly records dispersed amount and retention remainder."""
+    engine = MuleDetectionEngine(DEFAULT_RISK_CONFIG)
+    in_tx = _make_tx("rec_in_8", "TX_IN_8", "IN", 10000.0, "2026-03-01 10:00:00")
+    out_tx = _make_tx("rec_out_8", "TX_OUT_8", "OUT", 8400.0, "2026-03-01 10:07:00")
+
+    res = engine.detect_rapid_pass_through([in_tx, out_tx])
+
+    assert res["signal_strength"] == "MODERATE"
+    assert res["measured_value"]["percentage"] == 84.0
+    assert res["measured_value"]["incoming_amount"] == 10000.0
+    assert res["measured_value"]["dispersed_outgoing_amount"] == 8400.0
+
+
+def test_pass_through_correct_incoming_relative_timing():
+    """Verify elapsed time is strictly measured relative to incoming transaction, not unrelated prior transfers."""
+    engine = MuleDetectionEngine(DEFAULT_RISK_CONFIG)
+    prior_out = _make_tx("rec_prior", "TX_PRIOR", "OUT", 5000.0, "2026-03-01 09:20:00")
+    in_tx = _make_tx("rec_in_9", "TX_IN_9", "IN", 10000.0, "2026-03-01 10:00:00")
+    out_tx = _make_tx("rec_out_9", "TX_OUT_9", "OUT", 9000.0, "2026-03-01 10:08:00")
+
+    res = engine.detect_rapid_pass_through([prior_out, in_tx, out_tx])
+
+    assert res["elapsed_time"] == 8.0
+    assert res["official_criterion_met"] is True
+    assert res["signal_strength"] == "STRONG"
+
+
+def test_pass_through_no_double_counting():
+    """Verify an outgoing transaction cannot be double-counted across multiple incoming transactions."""
+    engine = MuleDetectionEngine(DEFAULT_RISK_CONFIG)
+    in1 = _make_tx("rec_in_10a", "TX_IN_10A", "IN", 10000.0, "2026-03-01 10:00:00")
+    in2 = _make_tx("rec_in_10b", "TX_IN_10B", "IN", 10000.0, "2026-03-01 10:02:00")
+    out = _make_tx("rec_out_10", "TX_OUT_10", "OUT", 9000.0, "2026-03-01 10:06:00")
+
+    res = engine.detect_rapid_pass_through([in1, in2, out])
+
+    assert res["incidents_count"] == 1
+    assert res["measured_value"]["dispersed_outgoing_amount"] == 9000.0
+    assert res["signal_strength"] == "STRONG"
+
+
+def test_pass_through_evidence_contract_fields():
+    """Verify all 11 required contract fields are explicitly present in detection response."""
+    engine = MuleDetectionEngine(DEFAULT_RISK_CONFIG)
+    in_tx = _make_tx("rec_in_11", "TX_IN_11", "IN", 10000.0, "2026-03-01 10:00:00")
+    out_tx = _make_tx("rec_out_11", "TX_OUT_11", "OUT", 9200.0, "2026-03-01 10:04:00")
+
+    res = engine.detect_rapid_pass_through([in_tx, out_tx])
+
+    required_fields = [
+        "feature_name",
+        "measured_value",
+        "elapsed_time",
+        "official_threshold",
+        "official_criterion_met",
+        "signal_strength",
+        "supporting_record_ids",
+        "supporting_transaction_ids",
+        "data_quality_confidence",
+        "score_contribution",
+        "explanation",
+    ]
+    for field in required_fields:
+        assert field in res, f"Missing required evidence contract field: {field}"
+

@@ -9,7 +9,11 @@ from app.algorithms.amount_lineage import AmountLineageEngine
 from app.algorithms.temporal_traversal import TemporalTraversalEngine
 from app.indexes.manager import ForensicIndexManager
 from app.schemas.graph import MoneyTrailGraph
-from app.schemas.investigation import InvestigationParameters, InvestigationTraceResponse
+from app.schemas.investigation import (
+    EvidenceMetadata,
+    InvestigationParameters,
+    InvestigationTraceResponse,
+)
 from app.utils.logging import log_event, logger
 
 
@@ -95,6 +99,16 @@ class InvestigationService:
             rule_version="2.0.0",
         )
 
+        # 5. Build evidence metadata with full provenance
+        edge_record_ids = [e.record_id for e in lineage_edges]
+        edge_tx_ids = [e.Transaction_ID for e in lineage_edges]
+        evidence_meta = EvidenceMetadata(
+            record_ids=edge_record_ids,
+            transaction_ids=edge_tx_ids,
+            lineage_rule="conservative_inflow_proportional",
+            max_bounded_depth=4,
+        )
+
         log_event(
             "TRACE_COMPLETED",
             investigation_id=investigation_id,
@@ -117,8 +131,6 @@ class InvestigationService:
             risk_summary={},
             recovery_summary={},
             shared_infrastructure={},
-            evidence_metadata={
-                "lineage_rule": "conservative_inflow_proportional",
-                "max_bounded_depth": 4,
-            },
+            evidence_metadata=evidence_meta,
         )
+

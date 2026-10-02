@@ -17,9 +17,19 @@ class RiskEngineConfig:
     rule_version: str = "1.0.0"
 
     # --- Thresholds ---
-    # Rapid Pass-Through: % of incoming value dispersed within short window
-    rapid_pass_through_window_minutes: float = 30.0
-    rapid_pass_through_min_ratio: float = 0.70  # 70% or more dispersed
+    # Rapid Pass-Through: Official criterion & graduated thresholds
+    # Official requirement: >= 90% dispersed within 3-15 minute window
+    rapid_pass_through_official_ratio: float = 0.90
+    rapid_pass_through_min_minutes: float = 0.0  # Lower bound for evaluation
+    rapid_pass_through_max_minutes: float = 15.0  # Configured 3-15m window upper bound
+    rapid_pass_through_window_minutes: float = 15.0  # Max evaluation window
+    rapid_pass_through_min_ratio: float = 0.70  # Baseline ratio for signal emergence
+
+    # Graduated severity ratio thresholds
+    pass_through_strong_ratio: float = 0.90    # >= 90% -> STRONG
+    pass_through_moderate_ratio: float = 0.80  # 80-89.99% -> MODERATE
+    pass_through_weak_ratio: float = 0.70      # 70-79.99% -> WEAK
+    # < 70% -> LOW/NO SIGNAL
 
     # Fan-In (Layer 1 Collector Indicator)
     fan_in_min_senders: int = 3
@@ -67,7 +77,13 @@ class RiskEngineConfig:
     def get_thresholds_dict(self) -> dict[str, Any]:
         """Return all active thresholds for audit and report inclusion."""
         return {
-            "rapid_pass_through_window_minutes": self.rapid_pass_through_window_minutes,
+            "rapid_pass_through_window_minutes": self.rapid_pass_through_max_minutes,
+            "rapid_pass_through_min_minutes": self.rapid_pass_through_min_minutes,
+            "rapid_pass_through_max_minutes": self.rapid_pass_through_max_minutes,
+            "rapid_pass_through_official_ratio": self.rapid_pass_through_official_ratio,
+            "pass_through_strong_ratio": self.pass_through_strong_ratio,
+            "pass_through_moderate_ratio": self.pass_through_moderate_ratio,
+            "pass_through_weak_ratio": self.pass_through_weak_ratio,
             "rapid_pass_through_min_ratio": self.rapid_pass_through_min_ratio,
             "fan_in_min_senders": self.fan_in_min_senders,
             "fan_out_min_receivers": self.fan_out_min_receivers,

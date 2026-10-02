@@ -22,8 +22,31 @@ class InvestigationParameters(BaseModel):
     rule_version: str = "2.0.0"
 
 
+class EvidenceMetadata(BaseModel):
+    """Evidence provenance metadata for investigation results.
+
+    Exposes: record_ids, transaction_ids, dataset_hash, rule_version, result_hash.
+    """
+
+    record_ids: list[str] = Field(default_factory=list, description="Supporting record_ids from source data")
+    transaction_ids: list[str] = Field(default_factory=list, description="Supporting Transaction_IDs from source data")
+    dataset_hash: str = Field("", description="SHA-256 of the source dataset")
+    rule_version: str = Field("2.0.0", description="Detection/rule engine version")
+    result_hash: str = Field("", description="SHA-256 integrity hash of investigation result")
+    lineage_rule: str = Field("conservative_inflow_proportional", description="Amount lineage algorithm used")
+    max_bounded_depth: int = Field(4, description="Maximum traversal depth enforced")
+
+
 class InvestigationTraceResponse(BaseModel):
-    """Full forensic investigation trace result."""
+    """Full forensic investigation trace result.
+
+    Final investigation object contract:
+    - investigation_id, victim_account, parameters
+    - money_trail, graph
+    - layer_candidates, risk (score + tier + features)
+    - recovery, shared_infrastructure
+    - evidence (record_ids, transaction_ids, dataset_hash, rule_version, result_hash)
+    """
 
     investigation_id: str
     dataset_id: str
@@ -34,9 +57,10 @@ class InvestigationTraceResponse(BaseModel):
     graph: MoneyTrailGraph | None = None
     execution_time_ms: float = 0.0
 
-    # Placeholders for later phases (as specified in Phase 2 architecture)
+    # Phase 3/4 enrichments
     layer_candidates: list[dict[str, Any]] = Field(default_factory=list)
     risk_summary: dict[str, Any] = Field(default_factory=dict)
     recovery_summary: dict[str, Any] = Field(default_factory=dict)
     shared_infrastructure: dict[str, Any] = Field(default_factory=dict)
-    evidence_metadata: dict[str, Any] = Field(default_factory=dict)
+    evidence_metadata: EvidenceMetadata = Field(default_factory=EvidenceMetadata)
+

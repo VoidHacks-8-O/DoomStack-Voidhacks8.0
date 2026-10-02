@@ -64,29 +64,17 @@ class RiskAssessmentService:
         features: list[RiskFeature] = []
 
         # Feature 1: Rapid Pass-Through
-        pt_contrib = 0.0
-        pt_explanation = "No rapid pass-through dispersion observed."
-        if pass_through_res["is_detected"]:
-            p = pass_through_res["primary_incident"]
-            pt_contrib = self.config.weight_rapid_pass_through
-            pt_explanation = (
-                f"Rapid pass-through detected: {p['percentage']}% of incoming funds "
-                f"(₹{p['incoming_amount']:,.2f}) dispersed across {p['outgoing_transactions_count']} "
-                f"outgoing transactions within {p['elapsed_minutes']} minutes."
-            )
+        pt_contrib = pass_through_res.get("score_contribution", 0.0)
+        pt_explanation = pass_through_res.get("explanation", "No rapid pass-through candidate indicator observed.")
 
         features.append(
             RiskFeature(
                 feature_name="rapid_pass_through",
-                measured_value={
-                    "is_detected": pass_through_res["is_detected"],
-                    "incidents_count": pass_through_res["incidents_count"],
-                    "primary_incident": pass_through_res["primary_incident"],
-                },
+                measured_value=pass_through_res["measured_value"],
                 threshold_configured=pass_through_res["threshold_configured"],
                 supporting_record_ids=pass_through_res["supporting_record_ids"],
                 supporting_transaction_ids=pass_through_res["supporting_transaction_ids"],
-                data_quality_confidence=1.0 if transactions else 0.5,
+                data_quality_confidence=pass_through_res.get("data_quality_confidence", 1.0 if transactions else 0.5),
                 score_contribution=pt_contrib,
                 explanation=pt_explanation,
             )
